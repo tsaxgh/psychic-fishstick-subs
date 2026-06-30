@@ -28,7 +28,8 @@ const monthKey = (d) => {
 }
 const MONTH_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 const computeStatus = (sub) => {
-  if (sub.status === 'Cancelled') return 'Cancelled'
+  // Manual override statuses preserved
+  if (sub.status === 'Cancelled' || sub.status === 'Hold') return sub.status
   if (!sub.renewalDate) return sub.status || 'Active'
   const diff = daysBetween(sub.renewalDate)
   if (diff < 0) return 'Expired'
@@ -42,7 +43,6 @@ const monthlyAmount = (d) => {
   if (t === 'Quarterly') return a / 3
   return a
 }
-// Total credits = sum of credit purchases; consumed = total - remaining
 const totalCredits = (sub) => {
   if (Array.isArray(sub.creditPurchases) && sub.creditPurchases.length) {
     return sub.creditPurchases.reduce((s, p) => s + (Number(p.credits) || 0), 0)
@@ -55,7 +55,15 @@ const sanitize = (s) => {
   const total = totalCredits(rest)
   const remaining = Number(rest.creditsRemaining || 0)
   const consumed = Math.max(0, total - remaining)
-  return { ...rest, status, totalCredits: total, creditsConsumed: consumed }
+  const paidMonths = Array.isArray(rest.paidMonths) ? rest.paidMonths : []
+  const thisMonth = monthKey(new Date())
+  return {
+    ...rest, status,
+    totalCredits: total,
+    creditsConsumed: consumed,
+    paidMonths,
+    isPaidThisMonth: paidMonths.includes(thisMonth),
+  }
 }
 
 async function handler(request, ctx) {
@@ -66,6 +74,7 @@ async function handler(request, ctx) {
   const col = db.collection('subscriptions')
   const sourcesCol = db.collection('payment_sources')
   const paymentsCol = db.collection('payments')
+  const notifsCol = db.collection('notifications')
 
   try {
     // ============ SUBSCRIPTIONS ============
@@ -108,6 +117,7 @@ async function handler(request, ctx) {
         notes: body.notes || '',
         clientName: body.clientName || '',
         tags: Array.isArray(body.tags) ? body.tags : [],
+        paidMonths: [],
       }
       await col.insertOne(doc)
       return json(sanitize(doc), 201)
@@ -131,7 +141,7 @@ async function handler(request, ctx) {
       return json({ ok: true })
     }
 
-    // Add credit purchase / addon: POST /api/subscriptions/:id/credits
+    // Credits
     if (method === 'POST' && /^subscriptions\/[^/]+\/credits$/.test(path)) {
       const id = path.split('/')[1]
       const body = await request.json()
@@ -155,15 +165,6 @@ async function handler(request, ctx) {
       return json(sanitize(updated))
     }
 
-    // Update credits remaining only: PATCH /api/subscriptions/:id/credits
-    if (method === 'PATCH' && /^subscriptions\/[^/]+\/credits$/.test(path)) {
-      const id = path.split('/')[1]
-      const body = await request.json()
-      await col.updateOne({ id }, { $set: { creditsRemaining: Number(body.creditsRemaining || 0), updatedAt: new Date().toISOString() } })
-      const updated = await col.findOne({ id })
-      return json(sanitize(updated))
-    }
-
     // ============ PAYMENT SOURCES ============
     if (method === 'GET' && path === 'payment-sources') {
       const sources = await sourcesCol.find({}).toArray()
@@ -172,27 +173,16 @@ async function handler(request, ctx) {
         const { _id, ...src } = s
         const attached = subs.filter(x => x.paymentSourceId === src.id)
         const monthly = attached.reduce((sum, x) => sum + monthlyAmount(x), 0)
-        return {
-          ...src,
-          attachedCount: attached.length,
-          monthlySpend: Math.round(monthly),
-          yearlySpend: Math.round(monthly * 12),
-        }
+        return { ...src, attachedCount: attached.length, monthlySpend: Math.round(monthly), yearlySpend: Math.round(monthly * 12) }
       })
       return json(enriched)
     }
     if (method === 'POST' && path === 'payment-sources') {
       const body = await request.json()
       const doc = {
-        id: uuidv4(),
-        name: body.name || 'New Source',
-        type: body.type || 'Credit Card',
-        bank: body.bank || '',
-        last4: body.last4 || '',
-        expiryDate: body.expiryDate || '',
-        owner: body.owner || '',
-        isDefault: !!body.isDefault,
-        notes: body.notes || '',
+        id: uuidv4(), name: body.name || 'New Source', type: body.type || 'Credit Card',
+        bank: body.bank || '', last4: body.last4 || '', expiryDate: body.expiryDate || '',
+        owner: body.owner || '', isDefault: !!body.isDefault, notes: body.notes || '',
         createdAt: new Date().toISOString(),
       }
       await sourcesCol.insertOne(doc)
@@ -216,7 +206,6 @@ async function handler(request, ctx) {
     }
 
     // ============ MANUAL PAYMENTS ============
-    // GET /api/payments?month=YYYY-MM  or all
     if (method === 'GET' && path === 'payments') {
       const url = new URL(request.url)
       const monthFilter = url.searchParams.get('month')
@@ -224,13 +213,13 @@ async function handler(request, ctx) {
       const docs = await paymentsCol.find(q).sort({ paymentDate: -1 }).toArray()
       return json(docs.map(d => { const { _id, ...r } = d; return r }))
     }
-    // POST /api/payments - mark payment
+    // Mark payment - also update subscription's paidMonths
     if (method === 'POST' && path === 'payments') {
       const body = await request.json()
       const doc = {
         id: uuidv4(),
         subscriptionId: body.subscriptionId,
-        month: body.month, // YYYY-MM
+        month: body.month,
         status: body.status || 'Paid',
         paymentDate: body.paymentDate || new Date().toISOString(),
         transactionId: body.transactionId || '',
@@ -239,15 +228,41 @@ async function handler(request, ctx) {
         notes: body.notes || '',
         createdAt: new Date().toISOString(),
       }
-      // Upsert by subscriptionId+month
       await paymentsCol.deleteOne({ subscriptionId: doc.subscriptionId, month: doc.month })
       await paymentsCol.insertOne(doc)
+      // Reflect on subscription
+      await col.updateOne(
+        { id: doc.subscriptionId },
+        { $addToSet: { paidMonths: doc.month }, $set: { lastPaymentDate: doc.paymentDate, updatedAt: new Date().toISOString() } }
+      )
+      // Notification
+      const sub = await col.findOne({ id: doc.subscriptionId })
+      await notifsCol.insertOne({
+        id: uuidv4(), type: 'payment', tone: 'success',
+        title: `${sub?.platformName || 'Subscription'} marked paid`,
+        detail: `${MONTH_SHORT[Number(doc.month.slice(5, 7)) - 1]} ${doc.month.slice(0, 4)} · ${doc.transactionId || 'No TXN'}`,
+        createdAt: new Date().toISOString(), read: false,
+      })
       const { _id, ...rest } = doc
       return json(rest, 201)
     }
     if (method === 'DELETE' && path.startsWith('payments/')) {
       const id = path.split('/')[1]
+      const p = await paymentsCol.findOne({ id })
       await paymentsCol.deleteOne({ id })
+      if (p) {
+        await col.updateOne({ id: p.subscriptionId }, { $pull: { paidMonths: p.month } })
+      }
+      return json({ ok: true })
+    }
+
+    // ============ NOTIFICATIONS ============
+    if (method === 'GET' && path === 'notifications') {
+      const docs = await notifsCol.find({}).sort({ createdAt: -1 }).limit(30).toArray()
+      return json(docs.map(d => { const { _id, ...r } = d; return r }))
+    }
+    if (method === 'POST' && path === 'notifications/read-all') {
+      await notifsCol.updateMany({ read: false }, { $set: { read: true } })
       return json({ ok: true })
     }
 
@@ -258,24 +273,23 @@ async function handler(request, ctx) {
       const active = docs.filter(d => d.status === 'Active' || d.status === 'Expiring Soon').length
       const expired = docs.filter(d => d.status === 'Expired').length
       const expiringSoon = docs.filter(d => d.status === 'Expiring Soon').length
-      const autoRenewalCount = docs.filter(d => d.autoRenewal).length
+      const onHold = docs.filter(d => d.status === 'Hold').length
+      const autoRenewalCount = docs.filter(d => d.autoRenewal && d.status !== 'Cancelled').length
       const aiCredits = docs.filter(d => d.serviceType === 'AI Tool').reduce((s, d) => s + (Number(d.creditsRemaining) || 0), 0)
-      const monthlySpend = docs.filter(d => d.status !== 'Cancelled' && d.status !== 'Expired').reduce((s, d) => s + monthlyAmount(d), 0)
+      const monthlySpend = docs.filter(d => d.status !== 'Cancelled' && d.status !== 'Expired' && d.status !== 'Hold').reduce((s, d) => s + monthlyAmount(d), 0)
       const upcoming = docs.filter(d => {
-        if (!d.renewalDate) return false
+        if (!d.renewalDate || d.status === 'Cancelled' || d.status === 'Hold') return false
         const diff = daysBetween(d.renewalDate)
         return diff >= 0 && diff <= 30
       }).length
 
-      // Manual payments tracking
       const thisMonth = monthKey(new Date())
-      const manualSubs = docs.filter(d => d.renewalType === 'Manual' || !d.autoRenewal)
+      const manualSubs = docs.filter(d => (d.renewalType === 'Manual' || !d.autoRenewal) && d.status !== 'Cancelled' && d.status !== 'Hold')
       const paidThisMonth = allPayments.filter(p => p.month === thisMonth && p.status === 'Paid').length
-      const pendingThisMonth = manualSubs.filter(s => s.status !== 'Cancelled' && s.status !== 'Expired')
-        .filter(s => !allPayments.find(p => p.subscriptionId === s.id && p.month === thisMonth && p.status === 'Paid')).length
+      const pendingThisMonth = manualSubs.filter(s => s.status !== 'Expired')
+        .filter(s => !s.paidMonths.includes(thisMonth)).length
       const avgCost = docs.length ? Math.round(docs.reduce((s, d) => s + (Number(d.amount) || 0), 0) / docs.length) : 0
 
-      // Top expensive
       const topExpensive = [...docs].sort((a, b) => monthlyAmount(b) - monthlyAmount(a)).slice(0, 5)
         .map(d => ({ id: d.id, platformName: d.platformName, monthlyCost: Math.round(monthlyAmount(d)), category: d.category }))
 
@@ -284,7 +298,7 @@ async function handler(request, ctx) {
         monthlySpend: Math.round(monthlySpend),
         annualSpend: Math.round(monthlySpend * 12),
         upcomingRenewals: upcoming,
-        expired, expiringSoon,
+        expired, expiringSoon, onHold,
         aiCreditsRemaining: aiCredits,
         autoRenewalCount,
         manualPending: pendingThisMonth,
@@ -295,34 +309,30 @@ async function handler(request, ctx) {
       })
     }
 
-    // GET /api/dashboard/upcoming
     if (method === 'GET' && path === 'dashboard/upcoming') {
       const docs = (await col.find({}).toArray()).map(sanitize)
       const buckets = {}
       const now = new Date()
       for (let i = 0; i < 6; i++) {
         const d = new Date(now.getFullYear(), now.getMonth() + i, 1)
-        buckets[monthKey(d)] = { month: `${MONTH_SHORT[d.getMonth()]} ${d.getFullYear()}`, key: monthKey(d), total: 0, items: [] }
+        buckets[monthKey(d)] = { month: `${MONTH_SHORT[d.getMonth()]} ${d.getFullYear()}`, monthShort: MONTH_SHORT[d.getMonth()], year: d.getFullYear(), key: monthKey(d), total: 0, items: [] }
       }
       docs.forEach(d => {
-        if (!d.renewalDate || d.status === 'Cancelled') return
+        if (!d.renewalDate || d.status === 'Cancelled' || d.status === 'Hold') return
         const k = monthKey(d.renewalDate)
         if (buckets[k]) {
           buckets[k].total += Number(d.amount) || 0
-          buckets[k].items.push({ id: d.id, platform: d.platformName, amount: d.amount, renewalDate: d.renewalDate })
+          buckets[k].items.push({ id: d.id, platform: d.platformName, amount: d.amount, renewalDate: d.renewalDate, category: d.category })
         }
       })
       return json(Object.values(buckets))
     }
 
-    // GET /api/dashboard/analytics
     if (method === 'GET' && path === 'dashboard/analytics') {
       const docs = (await col.find({}).toArray()).map(sanitize)
-      const byCategory = {}
-      const byServiceType = {}
-      const trend = {}
+      const byCategory = {}, byServiceType = {}, trend = {}
       docs.forEach(d => {
-        if (d.status === 'Cancelled') return
+        if (d.status === 'Cancelled' || d.status === 'Hold') return
         const a = Number(d.amount) || 0
         byCategory[d.category] = (byCategory[d.category] || 0) + a
         byServiceType[d.serviceType] = (byServiceType[d.serviceType] || 0) + a
@@ -345,10 +355,9 @@ async function handler(request, ctx) {
       })
     }
 
-    // GET /api/dashboard/insights - smart computed insights
+    // ============ SMART INSIGHTS (always 8 boxes) ============
     if (method === 'GET' && path === 'dashboard/insights') {
       const docs = (await col.find({}).toArray()).map(sanitize)
-      const allPayments = (await paymentsCol.find({}).toArray()).map(d => { const { _id, ...r } = d; return r })
       const insights = []
       const thisMonth = monthKey(new Date())
       const nextMonthDate = new Date(); nextMonthDate.setMonth(nextMonthDate.getMonth() + 1)
@@ -356,7 +365,7 @@ async function handler(request, ctx) {
 
       // 1. Renewals next 30 days
       const upcoming30 = docs.filter(d => {
-        if (!d.renewalDate || d.status === 'Cancelled') return false
+        if (!d.renewalDate || d.status === 'Cancelled' || d.status === 'Hold') return false
         const diff = daysBetween(d.renewalDate); return diff >= 0 && diff <= 30
       })
       if (upcoming30.length > 0) {
@@ -364,61 +373,74 @@ async function handler(request, ctx) {
         insights.push({ icon: 'calendar', tone: 'info', title: `${upcoming30.length} renewals in next 30 days`, detail: `Total liability ₹${total.toLocaleString('en-IN')}` })
       }
 
-      // 2. Low AI credits prediction
-      docs.filter(d => d.serviceType === 'AI Tool' && d.creditsAvailable).forEach(d => {
+      // 2-3. AI credit warnings
+      docs.filter(d => d.serviceType === 'AI Tool' && d.creditsAvailable && d.status !== 'Hold').forEach(d => {
         const pct = (Number(d.creditsRemaining) / Number(d.creditsAvailable)) * 100
         if (pct < 25 && pct > 0) {
-          // Estimate exhaustion based on burn rate (simple: assume 30 days for full cycle)
           const remaining = Number(d.creditsRemaining)
           const consumed = Number(d.creditsAvailable) - remaining
           const daysSincePurchase = d.purchaseDate ? Math.max(1, daysBetween(d.purchaseDate) * -1) : 30
           const burnRate = consumed / Math.max(1, daysSincePurchase)
           const daysLeft = burnRate > 0 ? Math.round(remaining / burnRate) : null
-          insights.push({
-            icon: 'zap', tone: 'warn',
-            title: `${d.platformName} credits low (${Math.round(pct)}%)`,
-            detail: daysLeft ? `Estimated exhaustion in ${daysLeft} days` : `${remaining} credits remaining`,
-          })
+          insights.push({ icon: 'zap', tone: 'warn', title: `${d.platformName} credits low (${Math.round(pct)}%)`, detail: daysLeft ? `Estimated exhaustion in ${daysLeft} days` : `${remaining} credits remaining` })
         } else if (pct === 0) {
           insights.push({ icon: 'alert', tone: 'danger', title: `${d.platformName} out of credits`, detail: 'Top-up recommended' })
         }
       })
 
-      // 3. Spend forecast - next month vs this month
-      const spendForMonth = (mk) => docs.filter(d => d.renewalDate && monthKey(d.renewalDate) === mk && d.status !== 'Cancelled').reduce((s, d) => s + (Number(d.amount) || 0), 0)
+      // 4. Spend forecast
+      const spendForMonth = (mk) => docs.filter(d => d.renewalDate && monthKey(d.renewalDate) === mk && d.status !== 'Cancelled' && d.status !== 'Hold').reduce((s, d) => s + (Number(d.amount) || 0), 0)
       const thisMonthSpend = spendForMonth(thisMonth)
       const nextMonthSpend = spendForMonth(nextMonth)
-      if (nextMonthSpend > thisMonthSpend && nextMonthSpend > 0) {
-        const diff = nextMonthSpend - thisMonthSpend
-        insights.push({ icon: 'trend', tone: 'info', title: `Spending will increase by ₹${diff.toLocaleString('en-IN')} next month`, detail: `₹${thisMonthSpend.toLocaleString('en-IN')} → ₹${nextMonthSpend.toLocaleString('en-IN')}` })
+      if (nextMonthSpend > 0 && nextMonthSpend !== thisMonthSpend) {
+        const diff = Math.abs(nextMonthSpend - thisMonthSpend)
+        const up = nextMonthSpend > thisMonthSpend
+        insights.push({
+          icon: 'trend', tone: up ? 'warn' : 'success',
+          title: `Spend will ${up ? 'increase' : 'decrease'} by ₹${diff.toLocaleString('en-IN')} next month`,
+          detail: `₹${thisMonthSpend.toLocaleString('en-IN')} → ₹${nextMonthSpend.toLocaleString('en-IN')}`,
+        })
       }
 
-      // 4. Manual pending payments
-      const manualSubs = docs.filter(d => (d.renewalType === 'Manual' || !d.autoRenewal) && d.status !== 'Cancelled' && d.status !== 'Expired')
-      const pending = manualSubs.filter(s => !allPayments.find(p => p.subscriptionId === s.id && p.month === thisMonth && p.status === 'Paid'))
+      // 5. Manual pending
+      const manualSubs = docs.filter(d => (d.renewalType === 'Manual' || !d.autoRenewal) && d.status !== 'Cancelled' && d.status !== 'Expired' && d.status !== 'Hold')
+      const pending = manualSubs.filter(s => !s.paidMonths.includes(thisMonth))
       if (pending.length > 0) {
-        insights.push({ icon: 'wallet', tone: 'warn', title: `${pending.length} manual payment${pending.length > 1 ? 's' : ''} pending this month`, detail: pending.slice(0, 3).map(s => s.platformName).join(', ') + (pending.length > 3 ? '...' : '') })
+        insights.push({ icon: 'wallet', tone: 'warn', title: `${pending.length} manual payment${pending.length > 1 ? 's' : ''} pending this month`, detail: pending.slice(0, 3).map(s => s.platformName).join(', ') + (pending.length > 3 ? '…' : '') })
       }
 
-      // 5. Duplicates
-      const nameGroups = {}
-      docs.forEach(d => {
-        const key = (d.platformName || '').toLowerCase().trim()
-        if (!key) return
-        nameGroups[key] = (nameGroups[key] || 0) + 1
+      // 6. Unused tools recommendation (AI tools with >75% credits remaining and >14 days since purchase)
+      const unused = docs.filter(d => {
+        if (d.serviceType !== 'AI Tool' || !d.creditsAvailable) return false
+        if (d.status === 'Cancelled' || d.status === 'Hold') return false
+        const pct = (Number(d.creditsRemaining) / Number(d.creditsAvailable)) * 100
+        const purchaseAge = d.purchaseDate ? Math.abs(daysBetween(d.purchaseDate)) : 0
+        return pct > 75 && purchaseAge > 14
       })
+      if (unused.length > 0) {
+        const totalCost = unused.reduce((s, d) => s + monthlyAmount(d), 0)
+        insights.push({
+          icon: 'trash', tone: 'warn',
+          title: `${unused.length} potentially unused tool${unused.length > 1 ? 's' : ''}`,
+          detail: `Save ~₹${Math.round(totalCost).toLocaleString('en-IN')}/mo · ${unused.slice(0, 2).map(s => s.platformName).join(', ')}`,
+        })
+      }
+
+      // 7. Duplicates
+      const nameGroups = {}
+      docs.forEach(d => { const k = (d.platformName || '').toLowerCase().trim().split(/[\s—-]/)[0]; if (k) nameGroups[k] = (nameGroups[k] || 0) + 1 })
       const dups = Object.entries(nameGroups).filter(([k, v]) => v > 1)
       if (dups.length > 0) {
         insights.push({ icon: 'alert', tone: 'warn', title: `${dups.length} potential duplicate subscription${dups.length > 1 ? 's' : ''}`, detail: dups.map(([k]) => k).slice(0, 3).join(', ') })
       }
 
-      // 6. Expired needs attention
+      // 8. Expired needs attention
       const expired = docs.filter(d => d.status === 'Expired')
       if (expired.length > 0) {
         insights.push({ icon: 'alert', tone: 'danger', title: `${expired.length} subscription${expired.length > 1 ? 's' : ''} expired`, detail: expired.slice(0, 3).map(s => s.platformName).join(', ') })
       }
 
-      // 7. Healthy auto-renew ratio
+      // 9. Healthy auto-renew ratio
       const autoCount = docs.filter(d => d.autoRenewal && d.status !== 'Cancelled').length
       const total = docs.filter(d => d.status !== 'Cancelled').length
       if (total > 0) {
@@ -426,11 +448,21 @@ async function handler(request, ctx) {
         insights.push({ icon: 'check', tone: 'success', title: `${pct}% subscriptions auto-renew`, detail: `${autoCount} of ${total} active subs are on auto-pay` })
       }
 
+      // 10. On Hold count
+      const heldSubs = docs.filter(d => d.status === 'Hold')
+      if (heldSubs.length > 0) {
+        insights.push({ icon: 'pause', tone: 'info', title: `${heldSubs.length} subscription${heldSubs.length > 1 ? 's' : ''} on hold`, detail: heldSubs.slice(0, 3).map(s => s.platformName).join(', ') })
+      }
+
+      // Pad to 8 if needed with defaults
+      while (insights.length < 8) {
+        insights.push({ icon: 'check', tone: 'success', title: 'All systems healthy', detail: 'No new issues detected' })
+      }
+
       return json(insights.slice(0, 8))
     }
 
     // ============ PAYMENTS GRID ============
-    // GET /api/payments/grid - returns last 6 months grid
     if (method === 'GET' && path === 'payments/grid') {
       const docs = (await col.find({}).toArray()).map(sanitize)
       const allPayments = (await paymentsCol.find({}).toArray()).map(d => { const { _id, ...r } = d; return r })
@@ -442,7 +474,7 @@ async function handler(request, ctx) {
       }
       const manualSubs = docs.filter(d => (d.renewalType === 'Manual' || !d.autoRenewal) && d.status !== 'Cancelled')
       const rows = manualSubs.map(s => {
-        const row = { id: s.id, platformName: s.platformName, amount: s.amount, paymentOwner: s.paymentOwner, paymentSourceId: s.paymentSourceId, months: {} }
+        const row = { id: s.id, platformName: s.platformName, amount: s.amount, paymentOwner: s.paymentOwner, paymentSourceId: s.paymentSourceId, status: s.status, months: {} }
         months.forEach(m => {
           const p = allPayments.find(p => p.subscriptionId === s.id && p.month === m.key)
           row.months[m.key] = p ? { status: p.status, paymentDate: p.paymentDate, transactionId: p.transactionId, id: p.id } : { status: 'Pending' }
@@ -452,97 +484,149 @@ async function handler(request, ctx) {
       return json({ months, rows })
     }
 
-    // ============ SEED ============
+    // ============ CALENDAR (renewals grouped by month) ============
+    if (method === 'GET' && path === 'calendar') {
+      const url = new URL(request.url)
+      const monthsForward = Number(url.searchParams.get('months') || 12)
+      const docs = (await col.find({}).toArray()).map(sanitize)
+      const now = new Date()
+      const groups = {}
+      for (let i = 0; i < monthsForward; i++) {
+        const d = new Date(now.getFullYear(), now.getMonth() + i, 1)
+        groups[monthKey(d)] = { key: monthKey(d), monthName: `${['January','February','March','April','May','June','July','August','September','October','November','December'][d.getMonth()]} ${d.getFullYear()}`, items: [], total: 0 }
+      }
+      docs.forEach(d => {
+        if (!d.renewalDate || d.status === 'Cancelled') return
+        const k = monthKey(d.renewalDate)
+        if (groups[k]) {
+          groups[k].items.push({
+            id: d.id, platformName: d.platformName, amount: d.amount,
+            renewalDate: d.renewalDate, status: d.status, autoRenewal: d.autoRenewal,
+            serviceType: d.serviceType, category: d.category,
+          })
+          groups[k].total += Number(d.amount) || 0
+        }
+      })
+      Object.values(groups).forEach(g => g.items.sort((a, b) => new Date(a.renewalDate) - new Date(b.renewalDate)))
+      return json(Object.values(groups))
+    }
+
+    // ============ SEED with spread renewals ============
     if (method === 'POST' && path === 'seed') {
       await col.deleteMany({})
       await sourcesCol.deleteMany({})
       await paymentsCol.deleteMany({})
+      await notifsCol.deleteMany({})
       const today = new Date()
       const inDays = (n) => { const d = new Date(today); d.setDate(d.getDate() + n); return d.toISOString() }
 
-      // Payment sources
       const sources = [
         { id: uuidv4(), name: 'HDFC Credit Card', type: 'Credit Card', bank: 'HDFC', last4: '4521', owner: 'Rohit', isDefault: true, expiryDate: '12/27', createdAt: new Date().toISOString() },
         { id: uuidv4(), name: 'Axis Card', type: 'Credit Card', bank: 'Axis Bank', last4: '8901', owner: 'Priya', isDefault: false, expiryDate: '08/26', createdAt: new Date().toISOString() },
         { id: uuidv4(), name: 'ICICI Account', type: 'Bank', bank: 'ICICI', last4: '2310', owner: 'Aman', isDefault: false, createdAt: new Date().toISOString() },
         { id: uuidv4(), name: 'UPI - Razorpay', type: 'UPI', bank: '', last4: '', owner: 'Rohit', isDefault: false, createdAt: new Date().toISOString() },
+        { id: uuidv4(), name: 'Keshav Credit Card', type: 'Credit Card', bank: 'SBI', last4: '7723', owner: 'Keshav', isDefault: false, expiryDate: '05/28', createdAt: new Date().toISOString() },
       ]
       await sourcesCol.insertMany(sources)
-      const [hdfc, axis, icici, upi] = sources
+      const [hdfc, axis, icici, upi, keshav] = sources
 
+      // Spread across many months
       const demo = [
-        { platformName: 'ChatGPT Team', serviceType: 'AI Tool', category: 'Internal', amount: 1700, subscriptionType: 'Monthly', renewalDate: inDays(5), autoRenewal: false, renewalType: 'Manual', paymentOwner: 'Rohit', paymentSourceId: hdfc.id,
-          creditPurchases: [
-            { id: uuidv4(), type: 'initial', credits: 5000, amount: 1700, purchasedAt: inDays(-90), notes: 'Plan purchase' },
-            { id: uuidv4(), type: 'addon', credits: 2000, amount: 800, purchasedAt: inDays(-30), notes: 'Top-up' },
-            { id: uuidv4(), type: 'addon', credits: 500, amount: 250, purchasedAt: inDays(-10), notes: 'Quick top-up' },
-          ], creditsRemaining: 1700, tags: ['ai','team'] },
-        { platformName: 'Claude Pro', serviceType: 'AI Tool', category: 'Internal', amount: 1800, subscriptionType: 'Monthly', renewalDate: inDays(12), autoRenewal: true, renewalType: 'Auto', paymentOwner: 'Rohit', paymentSourceId: hdfc.id,
-          creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 200, amount: 1800, purchasedAt: inDays(-12) }], creditsRemaining: 145, tags: ['ai'] },
-        { platformName: 'Cursor Pro', serviceType: 'AI Tool', category: 'Internal', amount: 1650, subscriptionType: 'Monthly', renewalDate: inDays(20), autoRenewal: true, renewalType: 'Auto', paymentOwner: 'Priya', paymentSourceId: axis.id,
-          creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 500, amount: 1650, purchasedAt: inDays(-10) }], creditsRemaining: 380 },
-        { platformName: 'Midjourney', serviceType: 'AI Tool', category: 'Agency', amount: 2400, subscriptionType: 'Monthly', renewalDate: inDays(2), autoRenewal: false, renewalType: 'Manual', paymentOwner: 'Aman', paymentSourceId: icici.id,
-          creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 200, amount: 2400, purchasedAt: inDays(-28) }], creditsRemaining: 8 },
-        { platformName: 'GoDaddy - example.com', serviceType: 'Domain', category: 'Client', amount: 1199, subscriptionType: 'Yearly', renewalDate: inDays(45), autoRenewal: true, renewalType: 'Auto', paymentOwner: 'Rohit', paymentSourceId: hdfc.id, clientName: 'Acme Corp' },
-        { platformName: 'Hostinger VPS', serviceType: 'VPS', category: 'Agency', amount: 18000, subscriptionType: 'Yearly', renewalDate: inDays(120), autoRenewal: true, renewalType: 'Auto', paymentOwner: 'Rohit', paymentSourceId: hdfc.id },
-        { platformName: 'Figma Org', serviceType: 'SaaS Tool', category: 'Agency', amount: 15000, subscriptionType: 'Yearly', renewalDate: inDays(80), autoRenewal: false, renewalType: 'Manual', paymentOwner: 'Priya', paymentSourceId: axis.id },
-        { platformName: 'Notion Team', serviceType: 'Workspace', category: 'Agency', amount: 6000, subscriptionType: 'Yearly', renewalDate: inDays(28), autoRenewal: true, renewalType: 'Auto', paymentOwner: 'Priya', paymentSourceId: axis.id },
-        { platformName: 'Slack Pro', serviceType: 'Communication Tool', category: 'Agency', amount: 8200, subscriptionType: 'Yearly', renewalDate: inDays(150), autoRenewal: true, renewalType: 'Auto', paymentOwner: 'Aman', paymentSourceId: icici.id },
-        { platformName: 'Google Workspace', serviceType: 'Workspace', category: 'Agency', amount: 24000, subscriptionType: 'Yearly', renewalDate: inDays(60), autoRenewal: true, renewalType: 'Auto', paymentOwner: 'Rohit', paymentSourceId: hdfc.id },
-        { platformName: 'HubSpot CRM', serviceType: 'CRM', category: 'Agency', amount: 36000, subscriptionType: 'Yearly', renewalDate: inDays(90), autoRenewal: false, renewalType: 'Manual', paymentOwner: 'Priya', paymentSourceId: axis.id },
-        { platformName: 'Meta Ads Manager', serviceType: 'Marketing Tool', category: 'Client', amount: 25000, subscriptionType: 'Monthly', renewalDate: inDays(7), autoRenewal: false, renewalType: 'Manual', paymentOwner: 'Aman', paymentSourceId: upi.id, clientName: 'Zenith Inc' },
-        { platformName: 'ElevenLabs', serviceType: 'AI Tool', category: 'Internal', amount: 950, subscriptionType: 'Monthly', renewalDate: inDays(18), autoRenewal: true, renewalType: 'Auto', paymentOwner: 'Rohit', paymentSourceId: hdfc.id,
-          creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 30000, amount: 950, purchasedAt: inDays(-12) }], creditsRemaining: 22000 },
-        { platformName: 'Perplexity Pro', serviceType: 'AI Tool', category: 'Internal', amount: 1650, subscriptionType: 'Monthly', renewalDate: inDays(-3), autoRenewal: false, renewalType: 'Manual', paymentOwner: 'Aman', paymentSourceId: upi.id,
-          creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 600, amount: 1650, purchasedAt: inDays(-33) }], creditsRemaining: 0 },
-        { platformName: 'Emergent.sh', serviceType: 'AI Tool', category: 'Agency', amount: 2500, subscriptionType: 'Monthly', renewalDate: inDays(14), autoRenewal: true, renewalType: 'Auto', paymentOwner: 'Rohit', paymentSourceId: hdfc.id,
-          creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 1000, amount: 2500, purchasedAt: inDays(-16) }], creditsRemaining: 720 },
+        // Current month renewals
+        { platformName: 'ChatGPT Team', serviceType: 'AI Tool', category: 'Internal', amount: 1700, subscriptionType: 'Monthly', renewalDate: inDays(5), autoRenewal: false, paymentOwner: 'Rohit', paymentSourceId: hdfc.id, creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 5000, amount: 1700, purchasedAt: inDays(-90) }, { id: uuidv4(), type: 'addon', credits: 2000, amount: 800, purchasedAt: inDays(-30) }, { id: uuidv4(), type: 'addon', credits: 500, amount: 250, purchasedAt: inDays(-10) }], creditsRemaining: 1700 },
+        { platformName: 'Midjourney', serviceType: 'AI Tool', category: 'Agency', amount: 2400, subscriptionType: 'Monthly', renewalDate: inDays(2), autoRenewal: false, paymentOwner: 'Aman', paymentSourceId: icici.id, creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 200, amount: 2400, purchasedAt: inDays(-28) }], creditsRemaining: 8 },
+        { platformName: 'Perplexity Pro', serviceType: 'AI Tool', category: 'Internal', amount: 1650, subscriptionType: 'Monthly', renewalDate: inDays(-3), autoRenewal: false, paymentOwner: 'Aman', paymentSourceId: upi.id, creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 600, amount: 1650, purchasedAt: inDays(-33) }], creditsRemaining: 0 },
+        // Month +1
+        { platformName: 'Claude Pro', serviceType: 'AI Tool', category: 'Internal', amount: 1800, subscriptionType: 'Monthly', renewalDate: inDays(12), autoRenewal: true, paymentOwner: 'Rohit', paymentSourceId: hdfc.id, creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 200, amount: 1800, purchasedAt: inDays(-12) }], creditsRemaining: 145 },
+        { platformName: 'Emergent.sh', serviceType: 'AI Tool', category: 'Agency', amount: 2500, subscriptionType: 'Monthly', renewalDate: inDays(14), autoRenewal: true, paymentOwner: 'Rohit', paymentSourceId: hdfc.id, creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 1000, amount: 2500, purchasedAt: inDays(-16) }], creditsRemaining: 720 },
+        { platformName: 'ElevenLabs', serviceType: 'AI Tool', category: 'Internal', amount: 950, subscriptionType: 'Monthly', renewalDate: inDays(18), autoRenewal: true, paymentOwner: 'Rohit', paymentSourceId: hdfc.id, creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 30000, amount: 950, purchasedAt: inDays(-18) }], creditsRemaining: 26500 },
+        { platformName: 'Cursor Pro', serviceType: 'AI Tool', category: 'Internal', amount: 1650, subscriptionType: 'Monthly', renewalDate: inDays(20), autoRenewal: true, paymentOwner: 'Priya', paymentSourceId: axis.id, creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 500, amount: 1650, purchasedAt: inDays(-10) }], creditsRemaining: 380 },
+        { platformName: 'Lovable Pro', serviceType: 'AI Tool', category: 'Agency', amount: 2000, subscriptionType: 'Monthly', renewalDate: inDays(22), autoRenewal: true, paymentOwner: 'Keshav', paymentSourceId: keshav.id, creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 300, amount: 2000, purchasedAt: inDays(-8) }], creditsRemaining: 290 },
+        { platformName: 'Notion Team', serviceType: 'Workspace', category: 'Agency', amount: 6000, subscriptionType: 'Yearly', renewalDate: inDays(28), autoRenewal: true, paymentOwner: 'Priya', paymentSourceId: axis.id },
+        // Month +2
+        { platformName: 'GoDaddy - acme.com', serviceType: 'Domain', category: 'Client', amount: 1199, subscriptionType: 'Yearly', renewalDate: inDays(38), autoRenewal: true, paymentOwner: 'Rohit', paymentSourceId: hdfc.id, clientName: 'Acme Corp' },
+        { platformName: 'Bolt.new', serviceType: 'AI Tool', category: 'Agency', amount: 1500, subscriptionType: 'Monthly', renewalDate: inDays(42), autoRenewal: false, paymentOwner: 'Aman', paymentSourceId: upi.id, creditPurchases: [{ id: uuidv4(), type: 'initial', credits: 100, amount: 1500, purchasedAt: inDays(-2) }], creditsRemaining: 78 },
+        { platformName: 'Vercel Pro', serviceType: 'Hosting', category: 'Agency', amount: 1700, subscriptionType: 'Monthly', renewalDate: inDays(48), autoRenewal: true, paymentOwner: 'Keshav', paymentSourceId: keshav.id },
+        // Month +3
+        { platformName: 'Google Workspace', serviceType: 'Workspace', category: 'Agency', amount: 24000, subscriptionType: 'Yearly', renewalDate: inDays(60), autoRenewal: true, paymentOwner: 'Rohit', paymentSourceId: hdfc.id },
+        { platformName: 'Linear', serviceType: 'SaaS Tool', category: 'Agency', amount: 9600, subscriptionType: 'Yearly', renewalDate: inDays(64), autoRenewal: true, paymentOwner: 'Priya', paymentSourceId: axis.id },
+        { platformName: 'GitHub Team', serviceType: 'SaaS Tool', category: 'Agency', amount: 4800, subscriptionType: 'Yearly', renewalDate: inDays(72), autoRenewal: true, paymentOwner: 'Keshav', paymentSourceId: keshav.id },
+        // Month +4
+        { platformName: 'Figma Org', serviceType: 'SaaS Tool', category: 'Agency', amount: 15000, subscriptionType: 'Yearly', renewalDate: inDays(80), autoRenewal: false, paymentOwner: 'Priya', paymentSourceId: axis.id },
+        { platformName: 'Razorpay', serviceType: 'SaaS Tool', category: 'Agency', amount: 12000, subscriptionType: 'Yearly', renewalDate: inDays(85), autoRenewal: true, paymentOwner: 'Aman', paymentSourceId: icici.id },
+        { platformName: 'AWS S3 Storage', serviceType: 'Hosting', category: 'Agency', amount: 8400, subscriptionType: 'Yearly', renewalDate: inDays(88), autoRenewal: true, paymentOwner: 'Rohit', paymentSourceId: hdfc.id },
+        // Month +5
+        { platformName: 'HubSpot CRM', serviceType: 'CRM', category: 'Agency', amount: 36000, subscriptionType: 'Yearly', renewalDate: inDays(95), autoRenewal: false, paymentOwner: 'Priya', paymentSourceId: axis.id },
+        { platformName: 'Meta Ads Manager', serviceType: 'Marketing Tool', category: 'Client', amount: 25000, subscriptionType: 'Monthly', renewalDate: inDays(98), autoRenewal: false, paymentOwner: 'Aman', paymentSourceId: upi.id, clientName: 'Zenith Inc' },
+        { platformName: 'Mailchimp', serviceType: 'Marketing Tool', category: 'Agency', amount: 14000, subscriptionType: 'Yearly', renewalDate: inDays(105), autoRenewal: true, paymentOwner: 'Priya', paymentSourceId: axis.id },
+        // Month +6
+        { platformName: 'Hostinger VPS', serviceType: 'VPS', category: 'Agency', amount: 18000, subscriptionType: 'Yearly', renewalDate: inDays(120), autoRenewal: true, paymentOwner: 'Rohit', paymentSourceId: hdfc.id },
+        { platformName: 'Cloudflare Pro', serviceType: 'Hosting', category: 'Agency', amount: 20000, subscriptionType: 'Yearly', renewalDate: inDays(125), autoRenewal: true, paymentOwner: 'Keshav', paymentSourceId: keshav.id },
+        // Month +7
+        { platformName: 'Zoom Business', serviceType: 'Communication Tool', category: 'Agency', amount: 18000, subscriptionType: 'Yearly', renewalDate: inDays(140), autoRenewal: true, paymentOwner: 'Aman', paymentSourceId: icici.id },
+        { platformName: 'Slack Pro', serviceType: 'Communication Tool', category: 'Agency', amount: 8200, subscriptionType: 'Yearly', renewalDate: inDays(150), autoRenewal: true, paymentOwner: 'Aman', paymentSourceId: icici.id },
+        // Month +8
+        { platformName: 'Adobe Creative Cloud', serviceType: 'SaaS Tool', category: 'Agency', amount: 32000, subscriptionType: 'Yearly', renewalDate: inDays(170), autoRenewal: true, paymentOwner: 'Priya', paymentSourceId: axis.id },
+        { platformName: 'Canva Teams', serviceType: 'SaaS Tool', category: 'Agency', amount: 5400, subscriptionType: 'Yearly', renewalDate: inDays(180), autoRenewal: false, paymentOwner: 'Keshav', paymentSourceId: keshav.id, status: 'Hold' },
+        // Month +9
+        { platformName: 'Microsoft 365', serviceType: 'Workspace', category: 'Agency', amount: 21000, subscriptionType: 'Yearly', renewalDate: inDays(200), autoRenewal: true, paymentOwner: 'Rohit', paymentSourceId: hdfc.id },
+        // Long-tail
+        { platformName: 'Twilio API', serviceType: 'SaaS Tool', category: 'Client', amount: 6000, subscriptionType: 'Yearly', renewalDate: inDays(220), autoRenewal: false, paymentOwner: 'Aman', paymentSourceId: icici.id, clientName: 'Zenith Inc' },
+        { platformName: 'SendGrid', serviceType: 'SaaS Tool', category: 'Client', amount: 4500, subscriptionType: 'Yearly', renewalDate: inDays(245), autoRenewal: true, paymentOwner: 'Aman', paymentSourceId: icici.id, clientName: 'Acme Corp' },
+        { platformName: 'GoDaddy - zenith.io', serviceType: 'Domain', category: 'Client', amount: 999, subscriptionType: 'Yearly', renewalDate: inDays(260), autoRenewal: true, paymentOwner: 'Rohit', paymentSourceId: hdfc.id, clientName: 'Zenith Inc' },
       ]
       const now = new Date().toISOString()
       const docs = demo.map(d => ({
         id: uuidv4(), createdAt: now, updatedAt: now,
         purchaseDate: d.creditPurchases?.[0]?.purchasedAt || now, currency: 'INR', paymentMode: 'Credit Card',
         registeredEmail: 'finance@agency.com', username: 'agency_admin',
-        adminAccess: '', notes: '', clientName: '', tags: [], creditPurchases: [],
+        adminAccess: '', notes: '', clientName: '', tags: [], creditPurchases: [], paidMonths: [],
         ...d,
         creditsAvailable: (d.creditPurchases || []).reduce((s, p) => s + (Number(p.credits) || 0), 0),
-        renewalFrequency: d.subscriptionType, status: 'Active',
+        renewalFrequency: d.subscriptionType,
+        renewalType: d.autoRenewal ? 'Auto' : 'Manual',
+        status: d.status || 'Active',
       }))
       await col.insertMany(docs)
 
-      // Seed some manual payment history
-      const chatgpt = docs.find(d => d.platformName === 'ChatGPT Team')
-      const midjourney = docs.find(d => d.platformName === 'Midjourney')
-      const meta = docs.find(d => d.platformName === 'Meta Ads Manager')
-      const figma = docs.find(d => d.platformName === 'Figma Org')
+      // Manual payment history
       const histPayments = []
-      const monthOffset = (n) => {
-        const d = new Date(); d.setMonth(d.getMonth() + n); return monthKey(d)
-      }
-      if (chatgpt) {
-        ;[-5,-4,-3,-2,-1].forEach((m, i) => {
-          if (i === 2) return // pending one
-          histPayments.push({ id: uuidv4(), subscriptionId: chatgpt.id, month: monthOffset(m), status: 'Paid', paymentDate: inDays(m*30 + 5), transactionId: `TXN${Math.floor(Math.random()*1e8)}`, amount: chatgpt.amount, paymentSourceId: chatgpt.paymentSourceId, notes: '', createdAt: now })
+      const monthOffset = (n) => { const d = new Date(); d.setMonth(d.getMonth() + n); return monthKey(d) }
+      const setPaid = (platformName, monthsAgo) => {
+        const sub = docs.find(d => d.platformName === platformName)
+        if (!sub) return
+        monthsAgo.forEach(m => {
+          const mKey = monthOffset(m)
+          histPayments.push({ id: uuidv4(), subscriptionId: sub.id, month: mKey, status: 'Paid', paymentDate: inDays(m * 30 + 5), transactionId: `TXN${Math.floor(Math.random()*1e8)}`, amount: sub.amount, paymentSourceId: sub.paymentSourceId, notes: '', createdAt: now })
+          if (!sub.paidMonths) sub.paidMonths = []
+          sub.paidMonths.push(mKey)
         })
+        // persist paidMonths on sub
       }
-      if (midjourney) {
-        ;[-3,-2,-1].forEach(m => {
-          histPayments.push({ id: uuidv4(), subscriptionId: midjourney.id, month: monthOffset(m), status: 'Paid', paymentDate: inDays(m*30 + 2), transactionId: `TXN${Math.floor(Math.random()*1e8)}`, amount: midjourney.amount, paymentSourceId: midjourney.paymentSourceId, notes: '', createdAt: now })
-        })
-      }
-      if (meta) {
-        ;[-4,-3,-2].forEach(m => {
-          histPayments.push({ id: uuidv4(), subscriptionId: meta.id, month: monthOffset(m), status: 'Paid', paymentDate: inDays(m*30 + 7), transactionId: `TXN${Math.floor(Math.random()*1e8)}`, amount: meta.amount, paymentSourceId: meta.paymentSourceId, notes: '', createdAt: now })
-        })
-      }
-      if (figma) {
-        ;[-2,-1].forEach(m => {
-          histPayments.push({ id: uuidv4(), subscriptionId: figma.id, month: monthOffset(m), status: 'Paid', paymentDate: inDays(m*30 + 3), transactionId: `TXN${Math.floor(Math.random()*1e8)}`, amount: Math.round(figma.amount/12), paymentSourceId: figma.paymentSourceId, notes: '', createdAt: now })
-        })
-      }
+      setPaid('ChatGPT Team', [-5, -4, -3, -1])
+      setPaid('Midjourney', [-3, -2, -1])
+      setPaid('Meta Ads Manager', [-4, -3, -2])
+      setPaid('Figma Org', [-2, -1])
+      setPaid('Bolt.new', [-1])
       if (histPayments.length) await paymentsCol.insertMany(histPayments)
+      // Update paidMonths on subs
+      const subUpdates = {}
+      histPayments.forEach(p => { (subUpdates[p.subscriptionId] = subUpdates[p.subscriptionId] || []).push(p.month) })
+      for (const [subId, months] of Object.entries(subUpdates)) {
+        await col.updateOne({ id: subId }, { $set: { paidMonths: months } })
+      }
 
-      return json({ inserted: docs.length, sources: sources.length, payments: histPayments.length })
+      // Seed notifications
+      const notifs = [
+        { id: uuidv4(), type: 'renewal', tone: 'warn', title: 'Midjourney renews in 2 days', detail: '₹2,400 · Manual payment due', createdAt: inDays(-1), read: false },
+        { id: uuidv4(), type: 'credit', tone: 'danger', title: 'Perplexity Pro out of credits', detail: 'Top up immediately', createdAt: inDays(-1), read: false },
+        { id: uuidv4(), type: 'credit', tone: 'warn', title: 'ChatGPT Team credits at 23%', detail: 'Estimated 26 days remaining', createdAt: inDays(-2), read: false },
+        { id: uuidv4(), type: 'payment', tone: 'success', title: 'Midjourney paid for May', detail: '₹2,400 via ICICI · TXN85213094', createdAt: inDays(-5), read: true },
+        { id: uuidv4(), type: 'system', tone: 'info', title: '5 new subscriptions added', detail: 'Including Lovable Pro and Bolt.new', createdAt: inDays(-7), read: true },
+      ]
+      await notifsCol.insertMany(notifs)
+
+      return json({ inserted: docs.length, sources: sources.length, payments: histPayments.length, notifications: notifs.length })
     }
 
     return json({ error: 'Not found', path, method }, 404)
